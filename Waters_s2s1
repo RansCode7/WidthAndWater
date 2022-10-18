@@ -1,0 +1,89 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var GRWL = ee.FeatureCollection("users/eeProject/grwl"),
+    s2 = ee.ImageCollection("COPERNICUS/S2_SR"),
+    jrcmap = ee.Image("JRC/GSW1_3/GlobalSurfaceWater"),
+    table = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/CL_buffer"),
+    table2 = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/Hang_DM_line");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+var AOI=table.filter(ee.Filter.eq('Name','BaiH'));//XianT,HuangZ,XiangY,YangX,ShiQ,HuangJG,HangZ,BaiH,AnK
+var DM=table2.filter(ee.Filter.eq('Name','BaiH'));
+Map.centerObject(AOI, 14);
+var parameter = {//1. Data Selection
+              START_DATE: "2019-10-27",
+              STOP_DATE: "2019-10-29",
+              POLARIZATION:'VVVH',
+              ORBIT : 'ASCENDING',//'DESCENDING'
+              //GEOMETRY: geometry, //uncomment if interactively selecting a region of interest
+              GEOMETRY: AOI, 
+              //2. Additional Border noise correction
+              APPLY_ADDITIONAL_BORDER_NOISE_CORRECTION: true,
+              //3.Speckle filter
+              APPLY_SPECKLE_FILTERING: true,
+              SPECKLE_FILTER_FRAMEWORK: 'MULTI',
+              SPECKLE_FILTER: 'LEE', //'BOXCAR' ,'LEE','GAMMA MAP','REFINED LEE','LEE SIGMA'
+              SPECKLE_FILTER_KERNEL_SIZE: 9,
+              SPECKLE_FILTER_NR_OF_IMAGES: 10,
+              //4. Radiometric terrain normalization
+              APPLY_TERRAIN_FLATTENING: true,
+              DEM: ee.Image('USGS/SRTMGL1_003'),
+              TERRAIN_FLATTENING_MODEL: 'VOLUME',
+              TERRAIN_FLATTENING_ADDITIONAL_LAYOVER_SHADOW_BUFFER: 0,
+              //5. Output
+              FORMAT : 'DB',
+              CLIP_TO_ROI: true,
+              SAVE_ASSETS: false,
+              //6.S2
+              CLOUDY_PIXEL_PERCENTAGE:10,
+}
+var WATER_METHOD='Zou2018';//'Jones2019';'Zou2018';'GaoYN2020';'Rndwiotsu';'Ndwiotsu'
+var MAXDISTANCE=4000;//离GRWL最大距离
+var FILL_SIZE=100;//最小水体块
+var MAXBRANCHLENGTHTOREMOVE=150;//最大分支距离
+
+var wrapper = require('users/RAN_CHEN/FUNCTION:ImagePreprocessing');
+var helper = require('users/RAN_CHEN/S1Preprocessing:utilities.js');
+var waterfun=require('users/RAN_CHEN/FUNCTION:Water_s1');
+var widthfun = require('users/RAN_CHEN/FUNCTION:ImageToWidths_Yang_s2s1');
+var watermax=jrcmap.select('max_extent').clip(AOI);
+
+////数据集筛选s1////
+var s1_preprocces = wrapper.s1_preproc(parameter);//return [s1, s1_1]
+var s1 = s1_preprocces[0];
+s1_preprocces = s1_preprocces[1];
+print(s1_preprocces)
+var s1_view = s1.map(helper.add_ratio_lin).map(helper.lin_to_db2);
+var s1_preprocces_view = s1_preprocces.map(helper.add_ratio_lin).map(helper.lin_to_db2);
+
+var visparam = {bands:['VV','VH','VVVH_ratio'],min: [-20, -25, 1],max: [0, -5, 15]};
+//【S1提水】
+var images1=s1_preprocces_view.first()//.clip(AOI)
+var waterOut=waterfun.waters1vv2(images1,AOI).set('date',images1.get('date'),'scale',10,'crs',images1.select('VV').projection().crs());
+var waterOut=waterOut.updateMask(watermax).unmask(0).updateMask(waterOut.gte(0)).rename('waterMask')
+
+////数据集筛选s2////
+var s2_preprocces = wrapper.s2_preproc(parameter);
+print(s2_preprocces)
+var s2 = s2_preprocces[0];
+s2_preprocces = s2_preprocces[1];
+var visparam2 = {bands:['Red', 'Green', 'Blue'],min:0,max:0.3};
+
+//【S2提水】
+var image2=s2_preprocces.first()//.clip(AOI)
+var waterOut2 = widthfun.ClassifyWater(image2,'Zou2018',AOI);//'Jones2019','Zou2018','GaoYN2020'
+var waterOut2 = waterOut2.updateMask(watermax).unmask(0).updateMask(waterOut2.gte(0)).rename('waterMask')
+
+//【图层加载】
+Map.addLayer(s1_view.first().clip(AOI), visparam, 'First image in the processed S1 collection', true);
+Map.addLayer(s1_preprocces_view.first(), visparam, 'First image in the processed S1 collection', true);
+Map.addLayer(image2,visparam2,'RGB')
+
+Map.addLayer(watermax.mask(watermax),{palette:'gray'},'watermax',false)
+Map.addLayer(waterOut.mask(waterOut),{palette:'red'},'waters1')
+Map.addLayer(waterOut2.mask(waterOut2),{palette:'blue'},'waters2')
+
+var riverOut=widthfun.ExtractRiver(waterOut,MAXDISTANCE,FILL_SIZE,GRWL).select('riverMask')
+var riverOut2=widthfun.ExtractRiver(waterOut2,MAXDISTANCE,FILL_SIZE,GRWL).select('riverMask')
+Map.addLayer(riverOut.mask(riverOut),{band:['riverMask'],palette:'blue'},'riverOuts1')
+Map.addLayer(riverOut2.mask(riverOut2),{band:['riverMask'],palette:'red'},'riverOuts2')
+Map.addLayer(DM,'','DM')
+//Map.addLayer(AOI,'','AOI')

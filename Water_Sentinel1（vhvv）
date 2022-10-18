@@ -1,0 +1,121 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var s1 = ee.ImageCollection("COPERNICUS/S1_GRD"),
+    table = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/AOI_YangX"),
+    table2 = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/CL_buffer"),
+    table3 = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/AOI_AnK");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+//var AOI=table2.filter(ee.Filter.eq('Name','AnK'));
+var AOI=table3.geometry();
+var aoi=AOI;
+Map.centerObject(AOI,14)
+var parameter = {//1. Data Selection
+              START_DATE: "2018-10-13",
+              STOP_DATE: "2019-12-31",
+              POLARIZATION:'VVVH',
+              ORBIT : 'ASCENDING',//'DESCENDING'
+              //GEOMETRY: geometry, //uncomment if interactively selecting a region of interest
+              GEOMETRY: AOI, 
+              //2. Additional Border noise correction
+              APPLY_ADDITIONAL_BORDER_NOISE_CORRECTION: true,
+              //3.Speckle filter
+              APPLY_SPECKLE_FILTERING: true,
+              SPECKLE_FILTER_FRAMEWORK: 'MULTI',
+              SPECKLE_FILTER: 'LEE', //'BOXCAR' ,'LEE','GAMMA MAP','REFINED LEE','LEE SIGMA'
+              SPECKLE_FILTER_KERNEL_SIZE: 9,
+              SPECKLE_FILTER_NR_OF_IMAGES: 10,
+              //4. Radiometric terrain normalization
+              APPLY_TERRAIN_FLATTENING: true,
+              DEM: ee.Image('USGS/SRTMGL1_003'),
+              TERRAIN_FLATTENING_MODEL: 'VOLUME',
+              TERRAIN_FLATTENING_ADDITIONAL_LAYOVER_SHADOW_BUFFER: 0,
+              //5. Output
+              FORMAT : 'DB',
+              CLIP_TO_ROI: true,
+              SAVE_ASSETS: false,
+              //6.S2
+              CLOUDY_PIXEL_PERCENTAGE:10,
+}
+var wrapper = require('users/RAN_CHEN/FUNCTION:ImagePreprocessing');
+var helper = require('users/RAN_CHEN/S1Preprocessing:utilities.js');
+var widthfun = require('users/RAN_CHEN/FUNCTION:ImageToWidths_Yang_s2s1');
+var WATER_METHOD='Zou2018';//'Jones2019';'Zou2018';'GaoYN2020';'Rndwiotsu';'Ndwiotsu'
+//var visparam = {bands:['VV','VH','VVVH_ratio'],min: [-20, -25, 1],max: [0, -5, 15]};
+
+////数据集筛选s1////
+var s1_preprocces = wrapper.s1_preproc(parameter);//return [s1, s1_1]
+var s1 = s1_preprocces[0];
+s1_preprocces = s1_preprocces[1];
+var s1_view = s1.map(helper.add_ratio_lin).map(helper.lin_to_db2);
+var s1_preprocces_view = s1_preprocces.map(helper.add_ratio_lin).map(helper.lin_to_db2);
+////数据集筛选s2////
+var s2_preprocces = wrapper.s2_preproc(parameter);
+var s2 = s2_preprocces[0];
+s2_preprocces = s2_preprocces[1];
+var images2=s2_preprocces.first();
+Map.addLayer(images2,{bands:['Red','Green','Blue'],min:0,max:0.3},'S2')
+var waters2=widthfun.ClassifyWater(images2,WATER_METHOD,AOI).select('waterMask');
+
+var otsu = function(histogram) {
+  var counts = ee.Array(ee.Dictionary(histogram).get('histogram'));
+  var means = ee.Array(ee.Dictionary(histogram).get('bucketMeans'));
+  var size = means.length().get([0]);
+  var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+  var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+  var mean = sum.divide(total);
+  
+  var indices = ee.List.sequence(1, size);
+  var bss = indices.map(function(i) {
+    var aCounts = counts.slice(0, 0, i);
+    var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var aMeans = means.slice(0, 0, i);
+    var aMean = aMeans.multiply(aCounts)
+                      .reduce(ee.Reducer.sum(), [0]).get([0])
+                      .divide(aCount);
+    var bCount = total.subtract(aCount);
+    var bMean = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+    return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+           bCount.multiply(bMean.subtract(mean).pow(2)));
+    });
+  print(ui.Chart.array.values(ee.Array(bss), 0, means));
+  
+  return means.sort(bss).get([-1]);
+  };
+var image=s1_preprocces_view.first()
+var vvvh=image.select('VV').multiply(image.select('VH')).rename('VVVH')
+var image2=image.addBands(vvvh)
+Map.addLayer(image.multiply(-1), {bands:['VV'],min:5 ,max:25}, 'VV', true);
+Map.addLayer(image.multiply(-1), {bands:['VH'],min:15 ,max:36}, 'VH', true);
+Map.addLayer(image2, {bands:['VVVH'],min:100 ,max:700}, 'VVVH', true);
+var VV=image2.select('VV');
+
+var VVVH=image2.select('VVVH');
+print(image2,images2)
+var hisvv = VV.reduceRegion({
+  reducer: ee.Reducer.histogram(),
+  geometry: aoi, 
+  scale: 10,
+  bestEffort: true
+});
+
+var hisvvvh = VVVH.reduceRegion({
+  reducer: ee.Reducer.histogram(),
+  geometry: aoi, 
+  scale: 10,
+  bestEffort: true
+});
+print('histogram',hisvv,hisvvvh);
+
+var threshold1 = otsu(ee.Dictionary(hisvv).get('VV'));
+var threshold3 = otsu(ee.Dictionary(hisvvvh).get('VVVH'));
+print('threshold', threshold1,threshold3);
+
+var classA = VV.lte(threshold1).rename('watervv');
+
+var classC = VVVH.gt(threshold3).rename('watervvvh')
+var classs2=waters2.mask(waters2).rename('waterS2')
+print(classA,classC,classs2)
+Map.addLayer(classA.mask(classA), {palette: 'red'}, 'VVotsu')
+Map.addLayer(classC.mask(classC), {palette: 'green'}, 'VVVHostu')
+Map.addLayer(classs2.mask(classs2), {palette: 'red'}, 'waterS2')
+
+

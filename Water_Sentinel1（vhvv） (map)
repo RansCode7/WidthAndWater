@@ -1,0 +1,192 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var s1 = ee.ImageCollection("COPERNICUS/S1_GRD"),
+    table = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/AOI_YangX"),
+    table2 = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/CL_buffer"),
+    table3 = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/AOI_AnK");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+//var AOI=table2.filter(ee.Filter.eq('Name','AnK'));
+var AOI=table.geometry();
+var aoi=AOI;
+Map.centerObject(AOI,14)
+var parameter = {//1. Data Selection
+              START_DATE: "2016-1-1",
+              STOP_DATE: "2016-12-31",
+              POLARIZATION:'VVVH',
+              ORBIT : 'ASCENDING',//'DESCENDING'
+              //GEOMETRY: geometry, //uncomment if interactively selecting a region of interest
+              GEOMETRY: AOI, 
+              //2. Additional Border noise correction
+              APPLY_ADDITIONAL_BORDER_NOISE_CORRECTION: true,
+              //3.Speckle filter
+              APPLY_SPECKLE_FILTERING: true,
+              SPECKLE_FILTER_FRAMEWORK: 'MULTI',
+              SPECKLE_FILTER: 'LEE', //'BOXCAR' ,'LEE','GAMMA MAP','REFINED LEE','LEE SIGMA'
+              SPECKLE_FILTER_KERNEL_SIZE: 9,
+              SPECKLE_FILTER_NR_OF_IMAGES: 10,
+              //4. Radiometric terrain normalization
+              APPLY_TERRAIN_FLATTENING: true,
+              DEM: ee.Image('USGS/SRTMGL1_003'),
+              TERRAIN_FLATTENING_MODEL: 'VOLUME',
+              TERRAIN_FLATTENING_ADDITIONAL_LAYOVER_SHADOW_BUFFER: 0,
+              //5. Output
+              FORMAT : 'DB',
+              CLIP_TO_ROI: true,
+              SAVE_ASSETS: false,
+              //6.S2
+              CLOUDY_PIXEL_PERCENTAGE:10,
+}
+var wrapper = require('users/RAN_CHEN/FUNCTION:ImagePreprocessing');
+var helper = require('users/RAN_CHEN/S1Preprocessing:utilities.js');
+var widthfun = require('users/RAN_CHEN/FUNCTION:ImageToWidths_Yang_s2s1');
+var WATER_METHOD='Zou2018';//'Jones2019';'Zou2018';'GaoYN2020';'Rndwiotsu';'Ndwiotsu'
+//var visparam = {bands:['VV','VH','VVVH_ratio'],min: [-20, -25, 1],max: [0, -5, 15]};
+
+////数据集筛选s1////
+var s1_preprocces = wrapper.s1_preproc(parameter);//return [s1, s1_1]
+var s1 = s1_preprocces[0];
+s1_preprocces = s1_preprocces[1];
+//var s1_view = s1.map(helper.add_ratio_lin).map(helper.lin_to_db2);
+var s1_preprocces_view = s1_preprocces.map(helper.add_ratio_lin).map(helper.lin_to_db2);
+var s1Col=s1_preprocces_view
+print(s1Col)
+
+var otsu = function(histogram) {
+  var counts = ee.Array(ee.Dictionary(histogram).get('histogram'));
+  var means = ee.Array(ee.Dictionary(histogram).get('bucketMeans'));
+  var size = means.length().get([0]);
+  var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+  var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+  var mean = sum.divide(total);
+  
+  var indices = ee.List.sequence(1, size);
+  var bss = indices.map(function(i) {
+    var aCounts = counts.slice(0, 0, i);
+    var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var aMeans = means.slice(0, 0, i);
+    var aMean = aMeans.multiply(aCounts)
+                      .reduce(ee.Reducer.sum(), [0]).get([0])
+                      .divide(aCount);
+    var bCount = total.subtract(aCount);
+    var bMean = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+    return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+           bCount.multiply(bMean.subtract(mean).pow(2)));
+    });
+  //print(ui.Chart.array.values(ee.Array(bss), 0, means));
+  return means.sort(bss).get([-1]);
+  };
+  
+var filter = ee.Filter.equals({
+  leftField: "date",
+  rightField: "date"
+});
+var join = ee.Join.saveAll("matches");
+print(join)
+var joinCol = join.apply(s1Col.distinct("date"), s1Col, filter);//apply(primary,secondary,condition)
+
+joinCol = joinCol.map(function(image) {
+  var tempCol = ee.ImageCollection.fromImages(ee.List(image.get("matches")));//获取同天所有影像
+  var dayImg = tempCol.mean().clip(aoi);
+  var date = image.get("date");
+  dayImg = dayImg.set("date", date);
+  dayImg = dayImg.set("system:time_start", ee.Date.parse("yyyyMMdd", date).millis());//millis:自1970-01-01T00:00:00Z以来的毫秒数
+  return dayImg;
+});//FeatureCollection
+joinCol = ee.ImageCollection(joinCol);
+joinCol=joinCol.map(function(image){
+  var vvvh=image.select('VV').multiply(image.select('VH')).rename('VVVH').set("date", image.get("date"),"system:time_start", image.get("system:time_start"))
+  return vvvh
+})
+print(joinCol)
+var waterImgCol=joinCol.map(function(image) {
+  var VVVH=image.select('VVVH')
+  var his = VVVH.reduceRegion({
+                    reducer: ee.Reducer.histogram(), 
+                    geometry: aoi,
+                    scale: 10,
+                    maxPixels: 1e13,
+                    tileScale: 16
+                  });
+  var threshold = otsu(ee.Dictionary(his).get("VVVH"));
+  var water = VVVH.gte(threshold);
+  water = water.set("date", image.get("date"));
+  water = water.set("system:time_start", image.get("system:time_start"));
+  water = water.updateMask(water).rename("water");
+  var mask = water.connectedPixelCount(10, true);//8领域
+  water = water.updateMask(mask.gte(10));
+  var area = ee.Image.pixelArea().multiply(water);
+  var dict = area.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e13, 
+    tileScale: 16
+  });
+  return water.set("area", ee.Number(dict.get("area")).divide(1000000));
+});
+print("waterImgCol", waterImgCol);
+
+var rawLayer = null;
+var rawLayer2 =null;
+function addPanel(sCol,sCol2, key) {
+  var id_list = sCol.reduceColumns(ee.Reducer.toList(), [key]).get('list');
+  id_list.evaluate(function(ids) {
+    var total = ids.length;
+    var showTitle = ui.Label("", {fontWeight: 'bold'});
+    var curIndex = 0;
+    var bPlus = ui.Button("+", function() {
+      curIndex += 1;
+      if (curIndex >= total) {
+        curIndex = 0;
+      }
+      showTitle.setValue(ids[curIndex]);
+      showSelectRawImage2(sCol2, key, ids[curIndex]);
+      showSelectRawImage(sCol, key, ids[curIndex]);
+    });
+    var bReduce = ui.Button("-", function() {
+      curIndex -= 1;
+      if (curIndex < 0) {
+        curIndex = total - 1;
+      }
+      showTitle.setValue(ids[curIndex]);
+      showSelectRawImage2(sCol2, key, ids[curIndex]);
+      showSelectRawImage(sCol, key, ids[curIndex]);
+    });
+    showTitle.setValue(ids[curIndex]);
+    showSelectRawImage2(sCol2, key, ids[curIndex])
+    showSelectRawImage(sCol, key, ids[curIndex]);
+    var main = ui.Panel({
+      widgets: [
+        ui.Label('click "+" or "-" to move time window', {fontWeight: 'bold'}),
+        bPlus, bReduce,
+        ui.Label("select date: ", {fontWeight: 'bold'}),
+        showTitle
+      ],
+      style: {width: '200px', padding: '8px'}
+    });
+    ui.root.insert(0, main);
+  });
+}
+function showSelectRawImage(sCol, key, value) {
+  print("show raw image id is: " + value);
+  if (rawLayer !== null) {
+    Map.remove(rawLayer);
+    rawLayer = null;
+  }
+  var visParam = {
+    palette: "blue"  
+  };
+  var image = ee.Image(sCol.filter(ee.Filter.eq(key, value)).first());
+  rawLayer = Map.addLayer(image, visParam, value);
+}
+
+function showSelectRawImage2(sCol, key, value) {
+  if (rawLayer2 !== null) {
+    Map.remove(rawLayer2);
+    rawLayer2 = null;
+  }
+  var visParam2 = {bands:['VVVH'],min:100,max:700};
+  var image = ee.Image(sCol.filter(ee.Filter.eq(key, value)).first());
+  rawLayer2 = Map.addLayer(image, visParam2, 'VVVH');
+}
+
+addPanel(waterImgCol,joinCol, "date");

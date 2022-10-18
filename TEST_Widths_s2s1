@@ -1,0 +1,154 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var grwl = ee.FeatureCollection("users/eeProject/grwl"),
+    imageVisParam = {"opacity":1,"bands":["rawCL"],"palette":["14fff4","52ff27","ff3c10","eeffed"]},
+    s2a = ee.ImageCollection("COPERNICUS/S2_SR"),
+    s1 = ee.ImageCollection("COPERNICUS/S1_GRD"),
+    jrc = ee.Image("JRC/GSW1_3/GlobalSurfaceWater"),
+    table = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/Hang_DM_line"),
+    table2 = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/Hang_DM_point");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+var DMline=table.filter(ee.Filter.eq('Name','XianT')).geometry();
+var DMpoint=table.filter(ee.Filter.eq('Name','XianT')).geometry();
+var aoi=DMline.buffer(2000);
+Map.centerObject(aoi,15);
+////参数////
+
+var WATER_METHOD='Zou2018';     //'Jones2019';'Zou2018';'GaoYN2020';'Rndwiotsu';'Ndwiotsu'
+var AOI=aoi;                    //var OAOut=exports.CalculateOrthAngle(CLOut).clip(AOI)
+var MAXDISTANCE=4000;           //离GRWL最大距离
+var FILL_SIZE=333;              //最小水体块
+var MAXBRANCHLENGTHTOREMOVE=150;//最大分支距离
+var starts2 = '2019-11-15';
+var starts1 ='2019-12-1'
+var end = '2019-12-31';
+
+var widthfun = require('users/RAN_CHEN/FUNCTION:ImageToWidths_Yang_s2s1');
+var waterfun=require('users/RAN_CHEN/FUNCTION:Water_s1');
+var slope_lib = require('users/wushupu18/Nanhu:slope_correction_lib.js');
+////数据集筛选s2////
+var bns2 = ['B2', 'B3', 'B4', 'B8',  'B11', 'B12'];var bns = [ 'Blue', 'Green', 'Red', 'Nir', 'Swir1', 'Swir2'];
+var dataset_s2=s2a.filterDate(starts2,end).filterBounds(aoi)
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10)).map(widthfun.maskS2clouds).select(['B8','B4','B3','B2','B11','B12']).select(bns2,bns)
+                  .map(function(image) {var time_start = image.get("system:time_start");return image.set("date", ee.Date(time_start).format("yyyyMMdd"));})//HHmmss
+                  .sort("system:time_start");
+var waterOuts_s2=dataset_s2.map(function(image){
+  var crs=image.select('Red').projection().crs();
+  var scale=image.select('Red').projection().nominalScale();
+  var water=widthfun.ClassifyWater(image.clip(aoi),WATER_METHOD,aoi);
+  return water.set('date',image.get('date'),'scale',scale,'crs',crs);
+});
+////数据集筛选s1////
+var dataset_s1=s1.filterBounds(aoi).filterDate(starts1, end)
+                 .filter(ee.Filter.and(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'),ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'),ee.Filter.eq('instrumentMode', 'IW')))
+                 .map(function(image) {var time_start = image.get("system:time_start");return image.set("date", ee.Date(time_start).format("yyyyMMdd"));})//HHmmss
+                 .sort("system:time_start");
+var volume = slope_lib.slope_correction(dataset_s1,{'model': 'volume','elevation': ee.Image('USGS/SRTMGL1_003'),'buffer': 50});
+var waterOuts_s1=volume.map(function(image){
+  var crs=image.select('VV').projection().crs();
+  var scale=image.select('VV').projection().nominalScale();
+  //image=image.clip(aoi);var vv = image.select('VV'); var SVV = vv.focal_mean(3,'circle','pixels').rename('VV_Filtered');var water = SVV.lte(-16).rename('waterMask');
+  var water=waterfun.waters1vv(image,aoi);
+  return water.set('date',image.get('date'),'scale',scale,'crs',crs);
+});
+print(waterOuts_s2,waterOuts_s1)
+////数据集合并////
+var dataset=waterOuts_s2//.merge(waterOuts_s1).sort("date")
+var dataset=dataset.map(function(img){
+  var jrcwatermax=jrc.select('max_extent').clip(aoi);
+  var water=img.updateMask(jrcwatermax).unmask(0).updateMask(img.gte(0)).rename('waterMask');
+  return water
+})
+print(dataset)
+
+//Map.addLayer(dataset_s1.first().clip(aoi.buffer(500).bounds()),{bands: 'VV',min: -18, max: 0}, 'S1');
+Map.addLayer(dataset_s2.first().clip(aoi),{bands:['Red', 'Green', 'Blue'],min:0,max:0.3}, 'S2');
+//【提水】
+var waterOut=dataset.first();
+//Map.addLayer(watermax.mask(watermax),{palette:'gray'},'watermax')
+Map.addLayer(waterOut.mask(waterOut),{palette:'blue'},'water')
+//【提河】
+var bound=waterOut.select('waterMask').geometry();
+var cl=grwl.filterBounds(bound);
+Map.addLayer(cl,{palette:'blue'},"GRWL",false);
+var riverOut=widthfun.ExtractRiver(waterOut,MAXDISTANCE,FILL_SIZE,grwl);
+Map.addLayer(riverOut.mask(riverOut),{min:0,max:1,bands:["channelMask"],palette:'gray'},"channelOut")
+Map.addLayer(riverOut.mask(riverOut),{min:0,max:1,bands:["riverMask"],palette:'red'},"riverOut")
+
+//【提取河流中心线】
+var scale=ee.Number(riverOut.get('scale'));
+var riverMask=riverOut.select('riverMask');
+var distM=widthfun.CalcDistanceMap(riverMask,256,scale);
+var gradM=widthfun.CalcGradientMap(distM,scale);
+var cl1px=widthfun.CalcOnePixelWidthCenterline(riverMask,gradM,0.9);
+//【修剪河流中心线】
+var cl1pxCleaned=widthfun.CleanCenterline(cl1px,MAXBRANCHLENGTHTOREMOVE,true);//去除端点、角点
+var cl1pxCleaned=widthfun.CleanCenterline(cl1pxCleaned,MAXBRANCHLENGTHTOREMOVE,false);//去除冗余端点
+var cl1pxCleaned=widthfun.CleanCenterline(cl1pxCleaned,MAXBRANCHLENGTHTOREMOVE,false);//去除冗余端点
+var CLOut=riverOut.addBands(distM.rename('DistMap'))
+                  .addBands(gradM.rename('GradMap'))
+                  .addBands(cl1px.rename('RawCL'))
+                  .addBands(cl1pxCleaned.rename('CleanedCL'));
+print(CLOut)
+Map.addLayer(CLOut,{bands:["RawCL"],opacity:1,palette:["6516ff","fff3fc","1de0ff","ff4e19","f9ff9b"]},'RawCL',false)
+Map.addLayer(cl1pxCleaned.mask(cl1pxCleaned),{palette:'#1668ff'},'CleanedCL',false)
+
+//【求正交方向】
+var crs=waterOut.get('crs')
+var OAOut=widthfun.CalculateOrthAngle(CLOut);
+OAOut=OAOut.clip(AOI)
+var scale=OAOut.get('scale');
+var bound=OAOut.select('riverMask').geometry();
+var angle=OAOut.select('orthDegree');
+var RiverMASK=OAOut.select('riverMask');
+var ChannelMask=OAOut.select('channelMask');
+var dm = OAOut.select('DistMap');
+//【求河宽】
+var widths = widthfun.GetWidth(angle, ChannelMask, RiverMASK, dm, crs, bound, scale).map(widthfun.prepExport);
+print(widths)
+//var width=widths.aggregate_mean('width');
+//print(width)
+Map.addLayer(widths,'','Widths')
+//Map.addLayer(AOI,{color:'red',fillColor:'00000000'},'AOI');
+var GetXsectionEnds = function(f) {
+    var xc = ee.Number(f.get('x'));
+    var yc = ee.Number(f.get('y'));
+    var orthRad = ee.Number(f.get('angle')).divide(180).multiply(Math.PI); //convert angle in degree to radiance
+  
+    var halfWidth = ee.Number(f.get('toBankDistance')).multiply(1.5);
+    var cosRad = halfWidth.multiply(orthRad.cos());
+    var sinRad = halfWidth.multiply(orthRad.sin());
+    var p1 = ee.Geometry.Point([xc.add(cosRad), yc.add(sinRad)], crs);
+    var p2 = ee.Geometry.Point([xc.subtract(cosRad), yc.subtract(sinRad)], crs);
+  
+    var xlEnds = (ee.Feature(ee.Geometry.MultiPoint([p1, p2]), {
+        'xc': xc,
+        'yc': yc,
+        'longitude': f.get('lon'),
+        'latitude': f.get('lat'),
+        'orthogonalDirection': orthRad,
+        'MLength': halfWidth.multiply(2),
+        'p1': p1,
+        'p2': p2,
+        'crs': crs,//'image_id': sceneID
+        }));
+    return(xlEnds);
+  };
+var SwitchGeometry = function(f) {
+    return(f.setGeometry(ee.Geometry.LineString({coords: [f.get('p1'), f.get('p2')], geodesic: false})) 
+            .set('p1', null).set('p2', null)); //# remove p1 and p2
+  };
+  var clPoints = angle.rename(['angle'])
+                            .addBands(ee.Image.pixelCoordinates(crs))
+                            .addBands(ee.Image.pixelLonLat().rename(['lon', 'lat']))
+                            .addBands(dm.rename(['toBankDistance']))
+                            .sample({region: bound,
+                                     scale: scale,
+                                     projection: null,
+                                     factor: 1,
+                                     dropNulls: true});
+  
+  var xsectionsEnds = clPoints.map(GetXsectionEnds);//返回正交方向与河岸相交的两个点所连成的线段
+  var xsections = xsectionsEnds.map(SwitchGeometry);
+Map.addLayer(xsections,'','xsections')
+Map.addLayer(DMline,{color:'red'},'DMline');
+Map.addLayer(DMpoint,'','DMpoint');

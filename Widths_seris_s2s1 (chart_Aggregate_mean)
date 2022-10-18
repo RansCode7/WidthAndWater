@@ -1,0 +1,130 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var GRWL = ee.FeatureCollection("users/eeProject/grwl"),
+    s2a = ee.ImageCollection("COPERNICUS/S2_SR"),
+    s1 = ee.ImageCollection("COPERNICUS/S1_GRD"),
+    jrc = ee.Image("JRC/GSW1_3/GlobalSurfaceWater"),
+    DM_line = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/Hang_DM_line"),
+    DM_point = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/Hang_DM_point"),
+    CL_buffer = ee.FeatureCollection("users/RAN_CHEN/Hang_SoloDM/CL_buffer");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+var AOI=DM_line.filter(ee.Filter.eq('Name','XianT')).geometry().buffer(2000);//XianT,HuangZ,XiangY,YangX,ShiQ,HuangJG,HangZ,BaiH,AnK
+var Name='Widths_s2s1_Aggregatemean_XianT'
+Map.addLayer(DM_line,'','DMline');
+Map.addLayer(DM_point,'','DMpoint');
+Map.centerObject(AOI,12);
+Map.addLayer(AOI,'','AOI')
+var parameter = {//1. Data Selection
+              START_DATE: "2015-1-1",
+              STOP_DATE: "2019-12-31",
+              POLARIZATION:'VVVH',
+              ORBIT : 'ASCENDING',//'DESCENDING'
+              //GEOMETRY: geometry, //uncomment if interactively selecting a region of interest
+              GEOMETRY: AOI, 
+              //2. Additional Border noise correction
+              APPLY_ADDITIONAL_BORDER_NOISE_CORRECTION: true,
+              //3.Speckle filter
+              APPLY_SPECKLE_FILTERING: true,
+              SPECKLE_FILTER_FRAMEWORK: 'MONO',//MULTI
+              SPECKLE_FILTER: 'LEE', //'BOXCAR' ,'LEE','GAMMA MAP','REFINED LEE','LEE SIGMA'
+              SPECKLE_FILTER_KERNEL_SIZE: 9,
+              SPECKLE_FILTER_NR_OF_IMAGES: 10,
+              //4. Radiometric terrain normalization
+              APPLY_TERRAIN_FLATTENING: true,
+              DEM: ee.Image('USGS/SRTMGL1_003'),
+              TERRAIN_FLATTENING_MODEL: 'VOLUME',
+              TERRAIN_FLATTENING_ADDITIONAL_LAYOVER_SHADOW_BUFFER: 0,
+              //5. Output
+              FORMAT : 'DB',
+              CLIP_TO_ROI: true,
+              SAVE_ASSETS: false,
+              //6.S2
+              CLOUDY_PIXEL_PERCENTAGE:10,
+}
+var WATER_METHOD='Zou2018';//'Jones2019';'Zou2018';'GaoYN2020';'Rndwiotsu';'Ndwiotsu'
+var MAXDISTANCE=4000;//离GRWL最大距离
+var FILL_SIZE=333;//最小水体块
+var MAXBRANCHLENGTHTOREMOVE=150;//最大分支距离
+
+var wrapper = require('users/RAN_CHEN/FUNCTION:ImagePreprocessing');
+var helper = require('users/RAN_CHEN/S1Preprocessing:utilities.js');
+var waterfun=require('users/RAN_CHEN/FUNCTION:Water_s1');
+var widthfun = require('users/RAN_CHEN/FUNCTION:ImageToWidths_Yang_s2s1');
+var watermax=jrc.select('max_extent').clip(AOI);
+
+////数据集筛选s1////
+var s1_preprocces = wrapper.s1_preproc(parameter);//return [s1, s1_1]
+print(s1_preprocces)
+var s1 = s1_preprocces[0];
+s1_preprocces = s1_preprocces[1];
+var s1_view = s1.map(helper.add_ratio_lin).map(helper.lin_to_db2);
+var s1_preprocces_view = s1_preprocces.map(helper.add_ratio_lin).map(helper.lin_to_db2);
+////数据集筛选s2////
+var s2_preprocces = wrapper.s2_preproc(parameter);
+print(s2_preprocces)
+var s2 = s2_preprocces[0];
+s2_preprocces = s2_preprocces[1];
+////水体提取////
+var crs1=s1_preprocces_view.first().select('VV').projection().crs()
+var waterOuts_s1=s1_preprocces_view.map(function(image){
+  //var crs=image.select('VV').projection().crs();
+  //var scale=image.select('VV').projection().nominalScale();
+  var water=waterfun.waters1vv2(image,AOI);
+  return water.set('date',image.get('date'),'crs',crs1);
+});
+var crs2=s2_preprocces.first().select('Red').projection().crs();
+var waterOuts_s2=s2_preprocces.map(function(image){
+  //var crs=image.select('Red').projection().crs();
+  //var scale=image.select('Red').projection().nominalScale();
+  var water=widthfun.ClassifyWater(image,WATER_METHOD,AOI);
+  return water.set('date',image.get('date'),'crs',crs2);
+});
+//print(waterOuts_s1,waterOuts_s2)
+////数据集合并////
+var dataset=waterOuts_s2.merge(waterOuts_s1).sort("date")
+var dataset=dataset.map(function(img){
+  var jrcwatermax=jrc.select('max_extent').clip(AOI);
+  var water=img.updateMask(jrcwatermax).unmask(0).updateMask(img.gte(0)).rename('waterMask');
+  //var image=widthfun.ExtractRiver(water,MAXDISTANCE,FILL_SIZE,GRWL);
+  return water;
+})
+print(dataset)
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////提取河宽/////////
+//exports.ExtractWidths = function(waterImage,crs,GRWL,maxDistance,FILL_SIZE,maxBranchLengthToRemove,AOI)
+var WIDTHS=dataset.map(function(f){
+  var crs=f.get('crs');
+  var widths=widthfun.ExtractWidths_merge(f,crs,GRWL,MAXDISTANCE,FILL_SIZE,MAXBRANCHLENGTHTOREMOVE,AOI);
+  var width=widths.aggregate_mean('width');
+  return f.set('width',width,'crs',crs,'date',f.get('date'));
+});
+print(WIDTHS)
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+var dataList = WIDTHS.reduceColumns(ee.Reducer.toList(2), ["date", "width"]).get("list");
+print(dataList)
+/*dataList.evaluate(function(dList) {
+  var yValues = [];
+  var xValues = [];
+  for (var i=0; i<dList.length; i++) {
+    var data = dList[i];
+    xValues.push(data[0]+"");
+    yValues.push(data[1]);
+  }
+  
+  var chart = ui.Chart.array.values(ee.List(yValues), 0, ee.List(xValues))
+                .setSeriesNames(["河宽"])
+                .setOptions({
+                  title: "河宽变化趋势", 
+                  hAxis: {title: "Date"},
+                  vAxis: {title: "河流宽度(m)"},
+                  legend: null,
+                  lineWidth:1,
+                  pointSize:2
+                });
+  print(chart);
+});*/
+Export.table.toDrive({
+  collection: WIDTHS,
+  description: Name, 
+  folder: "Widths_s2s1_0716", 
+  fileNamePrefix: Name, 
+  fileFormat: "CSV"});
